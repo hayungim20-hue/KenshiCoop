@@ -1178,6 +1178,28 @@ bool knockDown(Character* c, bool on) {
     }
 }
 
+// local2b: knock a body out for a given time - the author applying a knockout
+// that another client's player dealt (stealth assassination is not a melee hit,
+// so the damage-report path never saw it).
+bool knockoutFor(Character* c, float seconds) {
+    if (!c || !(seconds > 0.0f)) return false;
+    __try {
+        MedicalSystem* med = &c->medical;
+        if (g_knockoutFn)      g_knockoutFn(med, 1.0f);
+        if (g_knockoutForceFn) g_knockoutForceFn(med, seconds);
+        return g_knockoutFn != 0 || g_knockoutForceFn != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+float readKnockoutTimer(Character* c) {
+    if (!c) return 0.0f;
+    float t = 0.0f;
+    __try { t = c->medical.knockoutTimer; } __except (EXCEPTION_EXECUTE_HANDLER) { t = 0.0f; }
+    return (t > 0.0f && t < 100000.0f) ? t : 0.0f;
+}
+
 // Maintain an already-down body WITHOUT re-triggering the collapse. knockDown()
 // calls knockout(1.0), which re-initiates the ragdoll fall every time - calling
 // that each tick produces the visible get-up/flop/ragdoll-spike flicker. The

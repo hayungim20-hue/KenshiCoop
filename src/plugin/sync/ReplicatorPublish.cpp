@@ -1131,12 +1131,11 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     bool trunc = false;
     unsigned int n = engine::listNpcsWide(gw, censusRadius_ * 1.25f, chars, states,
                                           NPC_CENSUS_MAX, &trunc);
-    // A truncated census is an ACTIVE falsehood, not just a thin one: every NPC
-    // past the cap is broadcast as "does not exist on the host", and the join
-    // culls its real local copy against that. The fill is per-anchor, so a dense
-    // region around one anchor can consume the whole budget and starve the
-    // peer's. Log the edges (and re-log slowly while it persists) rather than
-    // every beat - this runs at 1 Hz forever.
+    // A truncated census used to broadcast every omitted body as absent. The
+    // v66 incomplete flag preserves positive rows while disabling absence
+    // claims until a complete enumeration arrives. The fill is per-anchor, so
+    // one dense region can consume the budget. Log the edges (and re-log slowly
+    // while it persists) rather than every beat - this runs at 1 Hz forever.
     static unsigned long truncLogMs = 0; // main-thread only
     bool truncEdge = (trunc != censusPubTrunc_);
     if (truncEdge || (trunc && (now - truncLogMs) >= 30000)) {
@@ -1144,7 +1143,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         truncLogMs = now;
         char b[176]; _snprintf(b, sizeof(b) - 1,
             "[census] publish %s n=%u cap=%u radius=%.0f",
-            trunc ? "TRUNCATED (cap hit; far NPCs broadcast as absent)"
+            trunc ? "TRUNCATED (absence claims disabled)"
                   : "complete again",
             n, (unsigned)NPC_CENSUS_MAX, censusRadius_ * 1.25f);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
@@ -1238,7 +1237,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     pruneAttention(censusKeys);
     pruneLastHands(now);
-    net.queueNpcCensus(ownerId, hands, poss, m);
+    net.queueNpcCensus(ownerId, hands, poss, m, !trunc);
 
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
     // walk. Everything beyond the stream bubble's KEEP band belongs to the

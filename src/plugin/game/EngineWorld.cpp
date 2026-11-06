@@ -827,6 +827,34 @@ bool auditDeed(GameWorld* gw, const unsigned int bHand[5], DeedAudit* out) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+int listForeignFurniture(GameWorld* gw, const unsigned int bHand[5],
+                         unsigned int (*out)[5], unsigned int maxOut) {
+    if (!gw || !bHand || !out || maxOut == 0 || !g_getObjsFn) return -1;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return -1;
+    int n = 0;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        Faction* pf = playerFactionOf(gw);
+        Ogre::Vector3 c = ro->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &c, 250.0f, BUILDING, 512, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && (unsigned int)n < maxOut; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || o == ro) continue;
+            Building* f = static_cast<Building*>(o);
+            if (f->imADoor) continue;
+            bool inside = f->furnitureParentBuilding() == b;
+            if (!inside) inside = handEq(f->_NV_isIndoors(), bHand);
+            if (!inside) continue;
+            if (pf && f->owner == pf) continue; // the player's own furniture stays
+            if (readObjectHand(o, out[n])) ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
 // ---- Protocol 27: placed-building sync -----------------------------------
 
 // Fill a BuildRead from a live Building. Callers hold the SEH frame.
@@ -941,6 +969,7 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         return 0;
     }
+    const int captureBefore=g_buildCaptureSuppress;
     __try {
         Ogre::Quaternion rot(Ogre::Radian(heading), Ogre::Vector3::UNIT_Y);
         // createBuilding ADDS the terrain height to position.y rather than
@@ -963,7 +992,7 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
         // nested ones re-enter the capture hook and would echo this mint back.
         ++g_buildCaptureSuppress;
         Building* bld = g_createBldgFn(
-            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
+            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/playerFactionOf(gw), rot, /*cb*/0, // local2e: was 0 - an ownerless proxy opened as a TRADE ('too far')
             /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
             /*invisible*/false, completed, /*isFoliage*/false,
             /*floor*/0, /*isOutsideFurniture*/false);
@@ -995,8 +1024,11 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
                   ground, haveGround ? 1 : 0,
                   bld->_buildState.constructionProgress);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        return 1;
+        // The object exists even if its handle cannot be read. Treat that as
+        // an unknown outcome, never a safe-to-repeat refused factory call.
+        return haveHand ? 1 : -1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_buildCaptureSuppress=captureBefore;
         coop::logLine("[build] mint FAULTED");
         return -1;
     }
@@ -1123,6 +1155,32 @@ static bool isMachineClassType(int t) {
     return t == (int)BCTYPE_PRODUCTION || t == (int)BCTYPE_CRAFTING ||
            t == (int)BCTYPE_ITEM_FURNACE || t == (int)BCTYPE_FARM ||
            t == (int)BCTYPE_RESEARCH;
+}
+
+int listOwnerlessPlacedNear(GameWorld* gw, const unsigned int bHand[5],
+                            unsigned int (*out)[5], unsigned int maxOut) {
+    if (!gw || !bHand || !out || maxOut == 0 || !g_getObjsFn) return -1;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return -1;
+    int n = 0;
+    __try {
+        Faction* pf = playerFactionOf(gw);
+        Ogre::Vector3 c = ro->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &c, 40.0f, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && (unsigned int)n < maxOut; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || o == ro) continue;
+            Building* f = static_cast<Building*>(o);
+            if (f->imADoor || f->isAnInteriorObject || f->isFurnitureOf) continue;
+            int ct = (int)f->classType;
+            if (ct != (int)BCTYPE_STORAGE && !isMachineClassType(ct)) continue;
+            if (pf && f->owner == pf) continue;
+            if (readObjectHand(o, out[n])) ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
 }
 
 // True when the classType is ProductionBuilding-derived (has productionState /
@@ -1666,7 +1724,7 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
 }
 
 unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
-                               unsigned int maxOut, bool deadOnly) {
+                               unsigned int maxOut, bool deadOnly, bool includeDowned) {
     if (!gw || !out || maxOut == 0 || !g_getCharsFn) return 0;
     if (deadOnly && !g_isDeadCharFn) return 0;
     unsigned int n = 0;
@@ -1684,7 +1742,8 @@ unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
                 if (!o) continue;
                 if (isPlayerSquad(gw, o)) continue; // the owner authors its squad
                 Character* c = static_cast<Character*>(o);
-                if (deadOnly && !g_isDeadCharFn(c)) continue;
+                if (deadOnly && !g_isDeadCharFn(c) &&
+                    !(includeDowned && c->_NV_isUnconcious())) continue;
                 if (!o->getInventory()) continue;   // nothing to author
                 bool dup = false; // the interest spheres can overlap
                 for (unsigned int k = 0; k < n; ++k)
@@ -2147,6 +2206,23 @@ int captureTraderStock(GameWorld* gw, const unsigned int traderHand[5], InvItemE
         int n = (int)readInvItems(inv, out, 0, maxOut, outTruncated);
         if (outMoney) *outMoney = st->getMoney();
         return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int restockTrader(GameWorld* gw, const unsigned int traderHand[5]) {
+    (void)gw;
+    if (!traderHand || !g_getPlatoonFn) return -1;
+    // The hook's trampoline when installed (so the join-side refresh gate cannot
+    // swallow it), else the plain engine function.
+    PlatoonRefreshInvFn fn = g_refreshInvOrig ? g_refreshInvOrig : g_platoonRefreshInvFn;
+    if (!fn) return -1;
+    __try {
+        RootObject* ro = resolveObjectByHand(traderHand);
+        if (!ro) return 0;
+        ActivePlatoon* p = g_getPlatoonFn(static_cast<Character*>(ro));
+        if (!p) return 0;
+        fn(p, true);
+        return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 

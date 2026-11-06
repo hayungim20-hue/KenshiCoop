@@ -1,5 +1,15 @@
 # KenshiCoop
 
+> **This is a modified version (0.58.1-local2 fix release, November 2026)** of
+> [Savas07/KenshiCoop](https://github.com/Savas07/KenshiCoop) v0.58.1
+> (commit `58514ea`), maintained by Artil. It fixes crashes, squad-transfer
+> desyncs, trading and vendor sync and more - see [CHANGELOG.md](CHANGELOG.md).
+> Wire protocol v73: it does not interoperate with the upstream release.
+> Original work by nhoral and Savas07; licensed AGPL-3.0 like the original.
+>
+> **本修复版**基于 Savas07/KenshiCoop v0.58.1 修改（2026 年 11 月，Artil 维护），
+> 修复内容见 [CHANGELOG.md](CHANGELOG.md)。协议 v73，不能与原版混用。
+
 Setup + Demo: [https://www.youtube.com/watch?v=OqwVRRZEYGM](https://www.youtube.com/watch?v=OqwVRRZEYGM)
 
 Experimental **co-op multiplayer for [Kenshi](https://lofigames.com/)**, built as an
@@ -218,6 +228,8 @@ packet recording and replay) are built into every DLL and switched on with
 - [zeroit789](https://github.com/zeroit789) - the "Multiplayer (Wanderer x2)"
   co-op game start ([#15](https://github.com/nhoral/KenshiCoop/pull/15))
 - Lo-Fi Games - Kenshi
+- Artil - 0.58.1-local2 fix release (2026-11): crash, squad-transfer,
+  trading/vendor, building and loot sync fixes ([CHANGELOG.md](CHANGELOG.md))
 
 ## License
 

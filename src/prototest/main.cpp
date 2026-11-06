@@ -34,6 +34,8 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/sync/CensusPolicy.h" // v66: partial census is not absence evidence
+#include "../plugin/sync/TransferReturn.h" // failed transfer keeps its original object
 #include "../plugin/sync/SaveXfer.h"     // Part A: real save-transfer receiver end-to-end
 
 #include <set>
@@ -90,7 +92,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
-    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         37);
+    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         45);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
@@ -314,8 +316,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v65: trader lock + shop hand-over)",
-             (int)PROTOCOL_VERSION, 65);
+    CHECK_EQ("PROTOCOL_VERSION (v73: local2h trade cash + proxy destroy guard)",
+             (int)PROTOCOL_VERSION, 73);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -575,11 +577,12 @@ static void testFraming() {
     need = (unsigned)sizeof(EntityBatchHeader) + (unsigned)rh.count * (unsigned)sizeof(EntityState);
     CHECK("entity batch: overrun count rejected by len>=need", !(len >= need));
 
-    // NPC census framing (protocol 36): [NpcCensusHeader][u32 hand[5] * count],
-    // the exact "len >= need" bound NetLink applies plus the NPC_CENSUS_MAX cap.
+    // The production v66 decoder: full positional rows, with the incomplete
+    // bit removed BEFORE calculating lengths and offsets.
     {
         const unsigned CN = 4;
-        unsigned char cbuf[sizeof(NpcCensusHeader) + CN * 5 * sizeof(u32)];
+        unsigned char cbuf[sizeof(NpcCensusHeader) + CN * 32];
+        std::memset(cbuf, 0, sizeof(cbuf));
         NpcCensusHeader ch;
         ch.type = (u8)PKT_NPC_CENSUS; ch.ownerId = 1; ch.count = (u16)CN;
         std::memcpy(cbuf, &ch, sizeof(ch));
@@ -587,18 +590,27 @@ static void testFraming() {
         for (unsigned i = 0; i < CN * 5; ++i) hands[i] = 1000u + i;
         std::memcpy(cbuf + sizeof(ch), hands, sizeof(hands));
         NpcCensusHeader cr;
-        std::memcpy(&cr, cbuf, sizeof(cr));
-        unsigned clen  = (unsigned)sizeof(cbuf);
-        unsigned cneed = (unsigned)sizeof(NpcCensusHeader) + (unsigned)cr.count * 5 * (unsigned)sizeof(u32);
-        CHECK("npc census: full payload accepted",
-              clen >= cneed && cr.count == CN && cr.count <= NPC_CENSUS_MAX);
+        sync::CensusFrame frame;
+        CHECK("npc census: previous full-count format accepted",
+              sync::readCensusFrame(cbuf, sizeof(cbuf), cr, frame)
+              && frame.count == CN && frame.complete);
         u32 back[CN * 5];
         std::memcpy(back, cbuf + sizeof(cr), sizeof(back));
         CHECK("npc census: hands round-trip", std::memcmp(back, hands, sizeof(hands)) == 0);
-        cr.count = (u16)(CN + 1);
-        cneed = (unsigned)sizeof(NpcCensusHeader) + (unsigned)cr.count * 5 * (unsigned)sizeof(u32);
-        CHECK("npc census: overrun count rejected by len>=need", !(clen >= cneed));
-        CHECK("npc census: cap sane", NPC_CENSUS_MAX >= 256 && NPC_CENSUS_MAX <= 2048);
+        ch.count = sync::censusCountField(CN, false);
+        std::memcpy(cbuf, &ch, sizeof(ch));
+        CHECK("npc census: partial rows accepted at actual payload length",
+              sync::readCensusFrame(cbuf, sizeof(cbuf), cr, frame)
+              && frame.count == CN && !frame.complete);
+        CHECK("npc census: short positions rejected",
+              !sync::readCensusFrame(cbuf, sizeof(cbuf) - 1, cr, frame));
+        ch.count = (u16)(NPC_CENSUS_MAX + 1) | NPC_CENSUS_INCOMPLETE;
+        std::memcpy(cbuf, &ch, sizeof(ch));
+        CHECK("npc census: oversized masked count rejected",
+              !sync::readCensusFrame(cbuf, sizeof(cbuf), cr, frame));
+        CHECK("npc census: encoder clipping always marks incomplete",
+              sync::censusCountField(NPC_CENSUS_MAX + 1, true)
+                  == (NPC_CENSUS_MAX | NPC_CENSUS_INCOMPLETE));
     }
 
     // Save-file chunk framing (protocol 31): [SaveFileHeader][path][payload],
@@ -1907,6 +1919,115 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+static void testCensusEvidence() {
+    std::printf("\n== census existence evidence (protocol 66) ==\n");
+    using namespace coop::sync;
+    const u32 received = 10000, freshMs = 5000;
+    NpcCensusHeader sent, parsed;
+    sent.type = PKT_NPC_CENSUS;
+    sent.ownerId = 1;
+    sent.count = censusCountField(0, true);
+    CensusFrame frame;
+    Inbound in;
+    CHECK("complete empty census frame decodes",
+          readCensusFrame(&sent, sizeof(sent), parsed, frame)
+          && frame.count == 0 && frame.complete);
+    in.pushNpcCensus(parsed.ownerId, 0, 0, frame.count, frame.complete);
+    std::deque<InboundNpcCensus> receivedRows;
+    in.drainNpcCensus(receivedRows);
+    CHECK("genuinely empty world can establish absence",
+          receivedRows.size() == 1 && receivedRows.front().hands.empty()
+          && censusAllowsAbsence(receivedRows.front().complete, received, 11000, freshMs));
+
+    sent.count = censusCountField(0, false);
+    CHECK("failed enumeration with zero rows decodes as incomplete",
+          readCensusFrame(&sent, sizeof(sent), parsed, frame)
+          && frame.count == 0 && !frame.complete);
+    receivedRows.clear();
+    in.pushNpcCensus(parsed.ownerId, 0, 0, frame.count, frame.complete);
+    in.drainNpcCensus(receivedRows);
+    CHECK("failed empty scan never means empty world",
+          receivedRows.size() == 1 && !censusAllowsAbsence(
+              receivedRows.front().complete, received, 11000, freshMs));
+
+    const unsigned N = 2;
+    unsigned char payload[sizeof(NpcCensusHeader) + N * 32];
+    u32 hands[N * 5] = {1, 200, 3, 4, 5, 1, 201, 6, 7, 8};
+    float positions[N * 3] = {10, 20, 30, 40, 50, 60};
+    sent.count = censusCountField(N, false);
+    std::memcpy(payload, &sent, sizeof(sent));
+    std::memcpy(payload + sizeof(sent), hands, sizeof(hands));
+    std::memcpy(payload + sizeof(sent) + sizeof(hands), positions, sizeof(positions));
+    CHECK("partial positional census decodes",
+          readCensusFrame(payload, sizeof(payload), parsed, frame));
+    // Feed exactly the production decoder's masked offsets into the real
+    // thread-boundary queue, so count-flag or complete-state loss is visible.
+    const u32* rows = reinterpret_cast<const u32*>(payload + sizeof(parsed));
+    const float* pos = reinterpret_cast<const float*>(
+        payload + sizeof(parsed) + frame.count * 5 * sizeof(u32));
+    receivedRows.clear();
+    in.pushNpcCensus(parsed.ownerId, rows, pos, frame.count, frame.complete);
+    in.drainNpcCensus(receivedRows);
+    CHECK("partial census keeps existing bodies and positions",
+          receivedRows.size() == 1 && receivedRows.front().hands.size() == N * 5
+          && receivedRows.front().pos.size() == N * 3
+          && receivedRows.front().hands[8] == 7 && receivedRows.front().pos[5] == 60);
+    CHECK("partial census queue preserves incomplete flag",
+          receivedRows.size() == 1 && !receivedRows.front().complete
+          && !censusAllowsAbsence(receivedRows.front().complete, received, 11000, freshMs));
+    CHECK("fresh complete census can reject absent bodies",
+          censusAllowsAbsence(true, received, 14999, freshMs));
+    CHECK("freshness boundary stays inclusive",
+          censusAllowsAbsence(true, received, 15000, freshMs));
+    CHECK("loading stall cannot create new false absence",
+          !censusAllowsAbsence(true, received, 15001, freshMs));
+    CHECK("never received census cannot reject bodies",
+          !censusAllowsAbsence(true, 0, 1, freshMs));
+    CHECK("clock wrap does not stall valid absence evidence",
+          censusAllowsAbsence(true, 0xfffffff0u, 0x10u, freshMs));
+    CHECK("short census header rejected",
+          !readCensusFrame(&sent, sizeof(sent) - 1, parsed, frame));
+}
+
+struct ReturnBackendTest {
+    bool slotFree, sectionFree, gridFree, lastStore;
+    int location, operations;
+    ReturnBackendTest() : slotFree(false), sectionFree(false), gridFree(false),
+        lastStore(false), location(0), operations(0) {}
+    bool equip() { ++operations; if (slotFree) location = 1; return slotFree; }
+    bool originalSection() { ++operations; if (sectionFree) location = 2; return sectionFree; }
+    bool store() { ++operations; if (gridFree) location = 2; return gridFree; }
+    bool storeOrDrop() { ++operations; location = lastStore ? 2 : 3; return lastStore; }
+};
+
+static void testTransferReturn() {
+    std::printf("\n== refused transfer preserves the detached object ==\n");
+    ReturnBackendTest worn;
+    worn.slotFree = true; // full source grid, but its original worn slot is free
+    CHECK("worn item returns to equipment without requiring grid space",
+          returnTransferredObject(worn, true) == TRANSFER_RETURN_EQUIPPED
+          && worn.location == 1 && worn.operations == 1);
+    ReturnBackendTest bag;
+    bag.sectionFree = true;
+    CHECK("bagged item returns to its original section",
+          returnTransferredObject(bag, false) == TRANSFER_RETURN_STORED
+          && bag.location == 2 && bag.operations == 1);
+    ReturnBackendTest loose;
+    loose.gridFree = true;
+    CHECK("original section failure can recover in the source grid",
+          returnTransferredObject(loose, true) == TRANSFER_RETURN_STORED
+          && loose.location == 2);
+    ReturnBackendTest full;
+    CHECK("fully exhausted storage preserves real object on ground",
+          returnTransferredObject(full, true) == TRANSFER_RETURN_GROUND
+          && full.location == 3);
+    ReturnBackendTest changed;
+    changed.lastStore = true;
+    CHECK("engine fallback can store when callbacks opened space",
+          returnTransferredObject(changed, false) == TRANSFER_RETURN_STORED
+          && changed.location == 2);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1915,6 +2036,8 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testCensusEvidence();
+    testTransferReturn();
     testRoundTrips();
     testFraming();
     testSaveCrc();

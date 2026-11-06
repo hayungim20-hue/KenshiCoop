@@ -221,7 +221,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 if (sq->second.farMs != 0 &&
                     (now - sq->second.farMs) < FAR_RETRY_MS) continue;
             }
-            if (engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs)) {
+            if (bodyForKey(k, 0, 0)) { // local2f: includes bodies we moved into a peer's squad
                 // Resolvable again: disarm the far-mint dwell so a LATER real
                 // despawn restarts the sustained-miss clock from zero.
                 std::map<Key, SpawnReqState>::iterator ar = spawnReq_.find(k);
@@ -1156,6 +1156,36 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             proxyByKey_.erase(pit);
         }
     }
+    if (!c) {
+        // local2h: a body the peer earlier handed to us (CONTROL-FLIP claim) or
+        // that we re-containered under a different local hand. The peer still
+        // names it by its own wire key - the alias recorded at insertPeerMember.
+        std::map<Key, Character*>::iterator al = peerAliasBody_.find(oldK);
+        if (al != peerAliasBody_.end()) {
+            Character* cand = al->second;
+            peerAliasBody_.erase(al);
+            unsigned int ch[5];
+            bool alive = cand &&
+                engine::readObjectHand(reinterpret_cast<RootObject*>(cand), ch) &&
+                engine::resolveObjectByHand(ch) == reinterpret_cast<RootObject*>(cand);
+            char ab[200]; _snprintf(ab, sizeof(ab) - 1,
+                "[%s] REKEY-ALIAS old=%u,%u,%u,%u,%u -> local=%u,%u,%u,%u,%u alive=%d",
+                tag, oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
+                alive ? ch[0] : 0, alive ? ch[1] : 0, alive ? ch[2] : 0,
+                alive ? ch[3] : 0, alive ? ch[4] : 0, alive ? 1 : 0);
+            ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
+            if (alive) {
+                c = cand;
+                // Leaving OUR control: the hand we streamed it under is retired, so
+                // the peer's in-flight tail cannot rebind it and our publisher stops.
+                Key lk; lk.t = ch[0]; lk.c = ch[1]; lk.cs = ch[2]; lk.i = ch[3]; lk.s = ch[4];
+                if (!destOwned) {
+                    pinOwned_.erase(lk);
+                    pinPeer_[lk] = author;
+                }
+            }
+        }
+    }
     int repaired = 0, culled = -1;
     std::map<Key, Character*>::iterator ex = proxyByKey_.find(newK);
     if (ex != proxyByKey_.end()) {
@@ -1334,6 +1364,11 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
         else       { pinOwned_.erase(lk); pinPeer_[lk] = author; }
         if (ok) moveEcho_[lk.s] = nowMs();  // the engine may renumber the serial
         pinnedLocal = true;
+        // local2h: remember the peer's name for this body - its next edge
+        // (a move back, a re-recruit) arrives keyed by newK, not by lk.
+        peerAliasBody_[newK] = c;
+        // ...and if we now CONTROL it, tell the peer our name for it.
+        if (ownIt && ok) rebindOut_.push_back(std::make_pair(newK, lk));
     }
     int inSquad = -1;
     __try {

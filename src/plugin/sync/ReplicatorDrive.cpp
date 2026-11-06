@@ -50,6 +50,13 @@ Character* Replicator::bodyForKey(const Key& k, bool* viaProxy, bool* staleProxy
     if (viaProxy) *viaProxy = false;
     if (staleProxy) *staleProxy = false;
     Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (!c) {
+        // local2f: the new owner's hand for a body we moved into their squad.
+        std::map<u32, Key>::const_iterator mo = movedOutBySerial_.find(k.s);
+        if (mo != movedOutBySerial_.end())
+            c = engine::resolveCharByHand(mo->second.i, mo->second.s, mo->second.t,
+                                          mo->second.c, mo->second.cs);
+    }
     if (c || !(spawnSync_ || recruitSync_)) return c;
     std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
     if (pit == proxyByKey_.end()) return 0;
@@ -79,9 +86,9 @@ void Replicator::applyTargets(GameWorld* gw) {
     // accumulator armed and refresh the ATTACKER set (the bodies THIS client
     // controls) each tick, mirroring the guard-set rebuild. A guarded swing BY
     // one of these bodies ON a driven copy is captured for publishCombatHits;
-    // the set rebuild handles recruit/roster churn. On the host reportCombat_ is
-    // false, so the accumulator stays disabled (host swings land natively on
-    // the NPCs it owns). Only OWNED bodies (ownHands_) count: the player-squad
+    // the set rebuild handles recruit/roster churn. local2: the host reports
+    // too (its swings on join-authored NPC copies are guarded); host swings
+    // on NPCs it owns still land natively because those are not driven. Only OWNED bodies (ownHands_) count: the player-squad
     // list also holds our driven copies of the other players' characters, and
     // their cosmetic swings would be reported on top of their owners' own
     // reports - the same wound applied twice.
@@ -422,6 +429,33 @@ void Replicator::applyTargets(GameWorld* gw) {
         // publishCombatHits to forward to the host (which owns the real body).
         // World NPCs only - a squad copy is a peer PC (PvP, out of scope), but we
         // still drain it so the engine-side accumulator stays bounded.
+        // local2b: a KNOCKOUT the author never heard about. Stealth assassination
+        // collapses our copy directly (not through hitByMeleeAttack), so the guard
+        // above never sees it and the author's real body walks on (field report
+        // 2026-11-03: the join's assassination victims kept walking on the host).
+        // Report it once per episode; only when the author has said 'upright' for
+        // a while, so a copy still lying down after the author woke it is never
+        // mistaken for a fresh knockout (that would re-KO the author's body).
+        if (reportCombat_ && !isSquad) {
+            bool authorDown = coop::bodyIsDown(out.bodyState) || d.koLatched || d.deathLatched;
+            if (authorDown) d.authorDownMs = now;
+            engine::MedicalRead km;
+            bool localKo = engine::readMedical(c, &km) && km.valid && km.unconscious && !km.dead;
+            if (!localKo || authorDown) {
+                d.koReported = false;
+            } else if (!d.koReported && (d.authorDownMs == 0 || (now - d.authorDownMs) > 10000)) {
+                d.koReported = true;
+                float t = engine::readKnockoutTimer(c);
+                if (t < 10.0f) t = 10.0f;
+                if (t > 600.0f) t = 600.0f;
+                PendingHit& ph = pendingHits_[it->first];
+                if (t > ph.ko) ph.ko = t;
+                char kb[160]; _snprintf(kb, sizeof(kb) - 1,
+                    "[combat] KO seen locally hand=%u,%u ko=%.0fs - reporting to author",
+                    out.hIndex, out.hSerial, t);
+                kb[sizeof(kb) - 1] = '\0'; coop::logLine(kb);
+            }
+        }
         if (reportCombat_) {
             float rf = 0.0f, rb = 0.0f;
             if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
@@ -869,6 +903,16 @@ void Replicator::applyTargets(GameWorld* gw) {
                         "[furn] HEAL EXIT occ=%u,%u kind=%d ok=%d",
                         out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // local2e: a peer's PLAYER character in a bed/seat its owner never
+                    // reported got there on OUR local AI (an idle squad copy runs its
+                    // jobs, e.g. "sleep" - field run 2026-11-03: the join's character
+                    // walked to a bed 440 u away whenever it stood still, ejected every
+                    // 3 s and re-entering). Drop the AI goal that took it there and put
+                    // it back where its owner says it is, or it simply lies down again.
+                    if (isSquad) {
+                        engine::clearGoals(c);
+                        engine::applyRaw(c, out);
+                    }
                 }
                 // Still locally attached this tick: hold off all driving until
                 // the debounced exit (or a fresh stream bit) resolves it.
@@ -1082,7 +1126,34 @@ void Replicator::applyTargets(GameWorld* gw) {
         // graded bands (leave / walk-converge / logged teleport). Combatants skip the
         // AI-suspend path below (their AI must run to animate), reached only via this
         // early `continue`.
-        if (coop::taskIsCombat(out.task)) {
+        // local2: a world NPC whose streamed attack target is already down
+        // (unconscious or dead) on THIS client cannot be made to fight it - the
+        // engine's AI rejects a downed victim, so every re-issue left the copy
+        // frozen in a combat stance staring at the body (field run 2026-11-03:
+        // drifters over KO'd hungry bandits, order n=6 localFight=0). Treat the
+        // sample as non-combat; the ordinary disarm below drops the stance after
+        // COMBAT_DISARM_MS and the position drive takes over. Squad copies are
+        // left alone (a player may deliberately finish a downed enemy).
+        bool combatTask = coop::taskIsCombat(out.task);
+        if (combatTask && !isSquad) {
+            Key dk; dk.t = out.sType; dk.c = out.sContainer; dk.cs = out.sContainerSerial;
+            dk.i = out.sIndex; dk.s = out.sSerial;
+            Character* dt = bodyForKey(dk, 0, 0);
+            engine::MedicalRead dm;
+            if (dt && engine::readMedical(dt, &dm) && dm.valid && (dm.unconscious || dm.dead)) {
+                combatTask = false;
+                if (d.combatArmed && !d.downTgtLogged) {
+                    d.downTgtLogged = true;
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] target down locally hand=%u,%u tgt=%u,%u dead=%d - releasing stance",
+                        out.hIndex, out.hSerial, out.sIndex, out.sSerial, dm.dead ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            } else {
+                d.downTgtLogged = false;
+            }
+        }
+        if (combatTask) {
             d.dbgRegime = DR_COMBAT;
             bool hostWaiting = coop::taskIsCombatWait(out.task);
             d.combatSeenTick = now; // feeds the disarm debounce below

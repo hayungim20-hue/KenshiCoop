@@ -12,6 +12,7 @@
 // the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include "../sync/TransferReturn.h"
 #include <kenshi/util/TripleInt.h> // GameDataReference::values (research cost)
 
 namespace coop {
@@ -73,6 +74,29 @@ void fillItemProvenance(Item* it, InvItemEntry& e) {
 // top-level reconcile did exactly that, saw every bagged item as surplus, and ran a removal
 // for it against the wrong Inventory on every single apply.
 // External linkage (EngineInternal.h): the world TU's vendor probe shares it.
+// local2g: an inventory list can hold an Item* the engine has already freed (seen
+// 2026-11-06: detectAndPublishTransfers faulting in readInvItems every 0.4 s, then
+// heap damage killed the game 6 s later). Prove the object alive by a plain field
+// read of its handle resolving back to itself before any virtual call touches it.
+static bool itemAliveForRead(Item* it) {
+    unsigned int h[5];
+    bool ok = readObjectHand(reinterpret_cast<RootObject*>(it), h) &&
+              resolveObjectByHand(h) == reinterpret_cast<RootObject*>(it);
+    if (!ok) {
+        // local2h: a freed Item* still listed in a bag is a crash waiting for the next
+        // world teardown (load / quit). Say so - bounded, it is read every publish pass.
+        static unsigned int s_staleLogged = 0;
+        if (s_staleLogged < 20) {
+            ++s_staleLogged;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[inv] STALE-ITEM obj=%p listed in a bag but freed (expect a crash on the next load)",
+                (void*)it);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    return ok;
+}
+
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                           unsigned int maxOut, bool* outTruncated, bool includeNested) {
     if (outTruncated) *outTruncated = false;
@@ -103,6 +127,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 for (unsigned int i = 0; i < ni; ++i) {
                     Item* it = its[i].item;
                     if (!it) continue;
+                    if (!itemAliveForRead(it)) { trunc = true; continue; } // local2g: stale Item* in a list
                     GameData* gd = it->getGameData();
                     if (!gd) continue;
                     if (n >= maxOut) { trunc = true; break; }
@@ -147,6 +172,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
             for (int w = 0; w < 2; ++w) {
                 Item* it = wpns[w];
                 if (!it) continue;
+                if (!itemAliveForRead(it)) { trunc = true; continue; } // local2g: stale Item* in a list
                 GameData* gd = it->getGameData();
                 if (!gd) continue;
                 const char* sid = gd->stringID.c_str();
@@ -192,6 +218,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
         for (unsigned int i = 0; i < total; ++i) {
             Item* it = all[i];
             if (!it) continue;
+            if (!itemAliveForRead(it)) { trunc = true; continue; } // local2g: stale Item* in a list
             GameData* gd = it->getGameData();
             if (!gd) continue;
             if (it->isEquipped) continue; // worn gear was captured above, from equip sections
@@ -263,6 +290,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                     for (unsigned int i = 0; i < ni; ++i) {
                         Item* it = its[i].item;
                         if (!it) continue;
+                        if (!itemAliveForRead(it)) { trunc = true; continue; } // local2g: stale Item* in a list
                         GameData* gd = it->getGameData();
                         if (!gd) continue;
                         if (n >= maxOut) { trunc = true; break; }
@@ -289,6 +317,9 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
             }
         }
     }
+    // Filling the final slot can terminate the parent/section loops before
+    // they inspect another child. Conservatively unknown, never an empty bag.
+    if (includeNested && n >= maxOut) trunc = true;
     if (outTruncated) *outTruncated = trunc;
     return n;
 }
@@ -753,6 +784,10 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                 if (outContainerShort) *outContainerShort = true;
                 createLoose = 0;
             }
+            //    local2 (merge note): our 2026-11-03 fix created the bag unconditionally;
+            //    upstream 0.58.1's grace-gated create (the caller passes allowContainerCreate
+            //    once the W2 conservation channel had its chance) covers the same field case
+            //    (219 CREATE-SKIP-CONTAINER on the join) without racing the real bag's move.
         }
         if (createLoose > 0) {
             bool fromEq = (g[k].desiredEq > g[k].curEq);
@@ -951,7 +986,7 @@ bool applyInventoryItems(GameWorld* gw, Inventory* inv, const InvItemEntry* item
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
                             bool truncated, bool allowContainerCreate,
-                            bool* outContainerShort) {
+                            bool* outContainerShort, bool nestedComplete) {
     if (!gw) return false;
     RootObject* ro = resolveObjectByHand(cHand);
     if (!ro) return false;
@@ -974,7 +1009,8 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     }
     bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated,
                                     allowContainerCreate, outContainerShort);
-    if (nNested == 0) return changed;
+    // A complete nested snapshot with no children describes EMPTY bags too.
+    if (nNested == 0 && !nestedComplete) return changed;
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
     // to fill, and a bag identified from the stale read would be the wrong object (or gone).
@@ -1000,7 +1036,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         unsigned int nk = 0;
         for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
             if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
-        if (nk == 0) continue;
+        if (nk == 0 && !nestedComplete) continue;
         claimed += nk;
 
         // Which copy of this template is it, in the SENDER's order? The sender's Nth bag of a
@@ -1028,6 +1064,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         // Rank-aligned when we can, but NEVER a bag already reconciled this pass: our carry
         // order need not match the sender's, and reconciling one bag against two different
         // desired lists destroys the first list's items.
+        if (nk == 0 && ncand == 0) continue; // ordinary non-container top entry
         Inventory* sub = (rank < ncand) ? cands[rank] : 0;
         for (unsigned int j = 0; j < nUsed; ++j) if (used[j] == sub) { sub = 0; break; }
         if (!sub) {
@@ -1338,10 +1375,52 @@ int removeItemsFromContainerBySid(GameWorld* gw, const unsigned int cHand[5],
     return removed;
 }
 
+namespace {
+struct TransferReturnBackend {
+    Inventory* from;
+    Item* item;
+    int quantity;
+    unsigned short section;
+    // Keep faults inside the outer recovery guard. equipExisting's general
+    // wrapper swallows SEH and would let us keep using a possibly invalid item.
+    bool equip() { return g_equipItemFn && g_equipItemFn(from, item); }
+    bool originalSection() {
+        if (!section || !g_getSectionsFn) return false;
+        lektor<InventorySection*>* sections = g_getSectionsFn(from);
+        unsigned int n = sections ? sections->size() : 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            InventorySection* sec = (*sections)[i];
+            if (sec && sectionNameHash(sec->name.c_str()) == section)
+                return sec->addItem(item, quantity);
+        }
+        return false;
+    }
+    bool store() { return from->tryAddItem(item, quantity); }
+    bool storeOrDrop() {
+        // The engine's explicit drop-on-fail path preserves this exact object
+        // at its owner's feet, including a container's nested contents.
+        return from->addItem(item, quantity, /*dropOnFail=*/true, /*destroyOnFail=*/false);
+    }
+};
+
+TransferReturnResult restoreTransferObject(Inventory* from, Item* item,
+                                           int quantity, bool wasEquipped,
+                                           unsigned short section) {
+    TransferReturnBackend back = { from, item, quantity, section };
+    __try {
+        return returnTransferredObject(back, wasEquipped);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // An engine fault may have invalidated item: do not dereference it again.
+        return TRANSFER_RETURN_FAILED;
+    }
+}
+} // namespace
+
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
                               const char* sid, unsigned int typeCat, int qty,
-                              bool suspendVeto) {
+                              bool suspendVeto, bool* outDestinationRefused) {
+    if (outDestinationRefused) *outDestinationRefused = false;
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     RootObject* srcRo = resolveObjectByHand(srcHand);
     RootObject* dstRo = resolveObjectByHand(dstHand);
@@ -1349,40 +1428,88 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
     Inventory* src = invOf(srcRo);
     Inventory* dst = invOf(dstRo);
     if (!src || !dst) return 0;
-    const unsigned int MAXC = 64;
-    InvItemEntry cur[64];
-    Item* curItems[64];
-    unsigned int ncur = readInvItems(src, cur, curItems, MAXC);
     int moved = 0;
-    // This is normally a SANCTIONED cross-owner relocation (Protocol 37
-    // conservation), so suspend the trade veto for its duration - the veto only
-    // exists to refuse genuine UI drags, never our own reconciled moves. The
-    // xfer_block test passes suspendVeto=false to drive it AS a UI drag would
-    // (veto active), so it can assert the refusal + item conservation.
+    Item* pending = 0;
+    Inventory* pendingFrom = 0;
+    unsigned int pendingHand[5] = {0};
+    bool pendingIdentity = false, pendingEquipped = false;
+    int pendingQuantity = 0, pendingWhich = -1;
+    unsigned short pendingSection = 0;
     bool vetoSav = g_invVetoSuspend; if (suspendVeto) g_invVetoSuspend = true;
     __try {
-        // Loose stacks first (the ordinary bag-to-bag drag), then worn copies (the
-        // "drag straight out of an equip slot" trade the field report describes).
-        for (int pass = 0; pass < 2 && moved < qty; ++pass) {
-            for (unsigned int i = 0; i < ncur && moved < qty; ++i) {
-                if (!curItems[i]) continue;
-                if (cur[i].itemType != typeCat) continue;
-                if ((int)cur[i].equipped != pass) continue;
-                if (strcmp(cur[i].stringID, sid) != 0) continue;
-                int have = cur[i].quantity; if (have < 1) have = 1;
-                int take = qty - moved; if (take > have) take = have;
-                Item* taken = src->removeItemDontDestroy_returnsItem(curItems[i], take, false); // virtual
-                if (!taken) continue;
-                if (!dst->tryAddItem(taken, take)) {          // virtual: real-object relocation
-                    src->tryAddItem(taken, take);             // destination refused - put it back
-                    g_invVetoSuspend = vetoSav;
-                    return moved;
+        // A backpack owns a separate Inventory. A top-level-only relocation
+        // misses the real source and then fabricates a second item as fallback.
+        int bags = nestedContainerCount(gw, srcHand);
+        if (bags < 0) bags = 0;
+        for (int which = -1; which < bags && moved < qty; ++which) {
+            Inventory* from = which < 0 ? src : nestedInventoryOf(gw, srcHand, (unsigned int)which);
+            if (!from) continue;
+            InvItemEntry cur[INV_ITEMS_MAX];
+            Item* curItems[INV_ITEMS_MAX];
+            unsigned int ncur = readInvItems(from, cur, curItems, INV_ITEMS_MAX);
+            for (int pass = 0; pass < 2 && moved < qty; ++pass) {
+                for (unsigned int i = 0; i < ncur && moved < qty; ++i) {
+                    if (!curItems[i] || cur[i].itemType != typeCat) continue;
+                    if ((int)cur[i].equipped != pass) continue;
+                    if (strcmp(cur[i].stringID, sid) != 0) continue;
+                    int have = cur[i].quantity; if (have < 1) have = 1;
+                    int take = qty - moved; if (take > have) take = have;
+                    Item* taken = from->removeItemDontDestroy_returnsItem(curItems[i], take, false);
+                    if (!taken) continue;
+                    pending = taken; pendingFrom = from; pendingWhich = which;
+                    pendingQuantity = take; pendingEquipped = cur[i].equipped != 0;
+                    pendingSection = cur[i].section;
+                    pendingIdentity = readObjectHand(static_cast<RootObject*>(taken), pendingHand);
+                    bool added = dst->tryAddItem(taken, take);
+                    // Full character grid: try its real carried containers before
+                    // refusing, preserving the actual object and its quality.
+                    int dstBags = added ? 0 : nestedContainerCount(gw, dstHand);
+                    for (int db = 0; !added && db < dstBags; ++db) {
+                        Inventory* to = nestedInventoryOf(gw, dstHand, (unsigned int)db);
+                        if (to && to != from) added = to->tryAddItem(taken, take);
+                    }
+                    if (!added) {
+                        if (outDestinationRefused) *outDestinationRefused = true;
+                        TransferReturnResult restored = restoreTransferObject(
+                            from, taken, take, pendingEquipped, pendingSection);
+                        pending = 0; // restore helper owns the outcome, including a fault
+                        char b[200]; _snprintf(b, sizeof(b) - 1,
+                            "[xfer] MOVE-REFUSED sid='%s' qty=%d return=%u (1=equip 2=stored 3=ground 0=engine-fault)",
+                            sid, take, (unsigned int)restored);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        g_invVetoSuspend = vetoSav;
+                        return moved;
+                    }
+                    pending = 0; // successful add may have merged/freed the detached stack
+                    curItems[i] = 0;
+                    moved += take;
                 }
-                curItems[i] = 0; // detached; never touch this stack again
-                moved += take;
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (outDestinationRefused) *outDestinationRefused = true;
+        // A failed add may have already inserted or merged the item. Only a
+        // serial-checked hand that STILL resolves to this exact detached object
+        // permits recovery; never retry through the untrusted cached pointer.
+        TransferReturnResult restored = TRANSFER_RETURN_FAILED;
+        if (pending && pendingIdentity &&
+            resolveObjectByHand(pendingHand) == static_cast<RootObject*>(pending)) {
+            RootObject* source = resolveObjectByHand(srcHand);
+            Inventory* sourceInv = source ? invOf(source) : 0;
+            Inventory* from = pendingWhich < 0 ? sourceInv :
+                nestedInventoryOf(gw, srcHand, (unsigned int)pendingWhich);
+            if (from && from == pendingFrom) {
+                __try {
+                    if (!pending->isInInventory)
+                        restored = restoreTransferObject(from, pending, pendingQuantity,
+                                                           pendingEquipped, pendingSection);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+        }
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] MOVE-FAULT sid='%s' moved=%d detached-recovery=%u (unverified objects left untouched)",
+            sid, moved, (unsigned int)restored);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         g_invVetoSuspend = vetoSav;
         return moved;
     }
@@ -1729,6 +1856,36 @@ void updateWorldItemProxy(RootObject* proxy, float x, float y, float z) {
 
 bool removeWorldItemProxy(GameWorld* gw, RootObject* proxy) {
     if (!gw || !proxy || !g_destroyObjFn) return false;
+    // local2h: GameWorld::destroy is only valid for a FREE ground item. Every caller
+    // (peer cull, CLAIM-APPLY, NATIVE-TAKE, leave cleanup, REHOME-DEDUPE) resolves its
+    // target from a pointer or hand captured while the item lay on the ground - but a
+    // local character / AI looter may have picked it up since. Destroying it then frees
+    // an Item* still listed in an InventorySection; the dangling entry survives until the
+    // next world teardown, where the section walks it and calls through its dead vtable
+    // (host crash 2026-11-07 00:33 on load: kenshi+0x74901c call [rax+0x358] =
+    // Item::setInventoryWeAreIn on freed memory, under SaveManager::loadGame). It is also
+    // the source of the stale Item*s local2g found in readInvItems. Refuse: a duplicate
+    // item is recoverable, a freed-but-listed one is not.
+    {
+        unsigned int h[5];
+        if (!readObjectHand(proxy, h) || resolveObjectByHand(h) != proxy) {
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[wi] DESTROY-SKIP obj=%p (stale: hand does not resolve back)", (void*)proxy);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return false;
+        }
+        bool inBag = true;
+        __try { inBag = reinterpret_cast<Item*>(proxy)->isInInventory; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { inBag = true; }
+        if (inBag) {
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[wi] DESTROY-REFUSED obj=%p hand=%u,%u,%u,%u,%u (item is inside an inventory "
+                "now; destroying it would leave a dangling Item* in that bag)",
+                (void*)proxy, h[0], h[1], h[2], h[3], h[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return false;
+        }
+    }
     __try {
         return g_destroyObjFn(gw, proxy, /*justUnloaded*/false, "coop-worlditem-cull");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2060,6 +2217,16 @@ int pickupGroundItemAt(GameWorld* gw, const unsigned int cHand[5], const float p
 // spatial query. Fills out[3], returns 1 on success.
 int itemWorldPos(void* item, float out[3]) {
     if (!out || !item) return 0;
+    // local2c: `item` is often a handle remembered from an EARLIER tick (the departed
+    // weapon of the drop detector). A sold/merged item is freed by the engine, and a
+    // virtual getPosition through its reused memory executes garbage that SEH cannot
+    // contain (join crash 2026-11-03 20:56 in detectAndPublishWeaponDrops while trading).
+    // Prove it alive first: plain field read of its handle, resolved back to itself.
+    {
+        unsigned int h[5];
+        if (!readObjectHand(reinterpret_cast<RootObject*>(item), h)) return 0;
+        if (resolveObjectByHand(h) != reinterpret_cast<RootObject*>(item)) return 0;
+    }
     int ok = 0;
     __try {
         Ogre::Vector3 p = reinterpret_cast<RootObject*>(item)->getPosition();

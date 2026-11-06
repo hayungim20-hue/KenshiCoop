@@ -848,7 +848,9 @@ void coopPanelTick(const CoopPanelState* st, const CoopPanelActions* act) {
     }
 
     // F2 rising edge toggles the panel open/closed.
-    bool f2 = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+    // local2f: F2 hotkey disabled at the user's request (hosting/inviting uses the
+    // title-screen MULTIPLAYER button). Restore the GetAsyncKeyState(VK_F2) read to re-enable.
+    bool f2 = false;
     if (f2 && !g_panel.f2Down) {
         if (!g_panel.open) {
             g_panel.hostFlag      = st->isHost;

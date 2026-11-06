@@ -513,6 +513,7 @@ extern OwnGetMoneyFn g_ownGetMoneyFn;
 extern OwnSetMoneyFn g_ownSetMoneyFn;
 extern BuyItemFn     g_buyItemFn;
 extern PlatoonRefreshInvFn g_platoonRefreshInvFn;
+extern PlatoonRefreshInvFn g_refreshInvOrig; // the un-gated original once hooked (local2h)
 extern ShopGetTraderFn     g_shopGetTraderFn;
 extern CharIsTraderFn  g_charIsTraderFn;
 extern PlatBoolFn      g_platIsTraderFn;
