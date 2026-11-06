@@ -397,7 +397,11 @@ void loadConfig(Config& c) {
         // (scripts/CoopHarness.psm1) pins KENSHICOOP_CELL_AUTH=0 for every
         // scenario that does not ask for it, which is what keeps the tier a
         // fail-open proof rather than a co-test of this flag.
-        c.cellAuth = envOr("KENSHICOOP_CELL_AUTH", "1") != "0";
+        // local2d: DEFAULT OFF for this local build. The split-authority handover was
+        // the source of most NPC desyncs in the 2026-11-03 sessions (mass hides on
+        // handover, stale suppressions, KO/loot authority conflicts). The host authors
+        // every NPC, the pre-v0.47 behaviour. KENSHICOOP_CELL_AUTH=1 re-enables it.
+        c.cellAuth = envOr("KENSHICOOP_CELL_AUTH", "0") != "0";
         // Co-location collapse: hand every claimed cell to the host while the
         // squads are on top of each other. Only consulted when cellAuth is on -
         // with authority off the host already owns everything. "0" restores the

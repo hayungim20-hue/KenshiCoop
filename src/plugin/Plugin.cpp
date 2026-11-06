@@ -460,13 +460,24 @@ void rosterLoadForWorld(bool fresh) {
                 std::string name(line + used);
                 while (!name.empty() && (name[name.size() - 1] == '\n' || name[name.size() - 1] == '\r'))
                     name.erase(name.size() - 1);
-                rosterSet(id, sid, name);
                 if (id != 0 && sid != 0) {
                     char k[32];
                     _snprintf(k, sizeof(k) - 1, "%llu", sid);
                     k[sizeof(k) - 1] = '\0';
+                    // local2g: one Steam account, one seat. A reconnect that raced its own
+                    // stale connection was given a second id and saved as a second row; the
+                    // later row then won, so the friend came back on the wrong squad tab and
+                    // the host drove his real squad (field 2026-11-06). Keep the lowest id.
+                    std::map<std::string, coop::u32>::iterator rv = reserved.find(k);
+                    if (rv != reserved.end() && rv->second <= id) {
+                        char db[160]; _snprintf(db, sizeof(db) - 1,
+                            "[roster] duplicate row dropped: id %u is the same player as id %u", id, rv->second);
+                        db[sizeof(db) - 1] = '\0'; coopLog(db);
+                        continue;
+                    }
                     reserved[k] = id;
                 }
+                rosterSet(id, sid, name);
                 ++rows;
             }
             fclose(f);
@@ -2007,10 +2018,13 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             // the HOST applies it to the real body (blood + a frontal flesh wound),
             // which the vitals stream then mirrors back. Decouples the join PC's
             // damage from its disrupted (position-driven) copy animation.
-            if (g_cfg.isHost)
-                g_repl.applyCombatHits(gw, g_inbound);
-            else
-                g_repl.publishCombatHits(gw, g_net, g_net.localId());
+            // local2: with cell authority a JOIN can own world NPCs, so the
+            // HOST's guarded swings on those copies must be reported too and
+            // the join must apply them. Both roles now publish and apply;
+            // each packet is addressed (targetOwnerId) to the NPC's author
+            // and the receiver re-checks authority before wounding.
+            g_repl.applyCombatHits(gw, g_inbound);
+            g_repl.publishCombatHits(gw, g_net, g_net.localId());
         }
         // Character stats sync (protocol 17): owner-authoritative CharStats
         // stream for player-squad members, both directions. publishStats
@@ -3104,9 +3118,13 @@ void installEngineDetours() {
             // natively). Enabling report mode on the join makes the guard accumulate
             // the damage its player-squad melee WOULD have dealt to driven world-NPC
             // copies; publishCombatHits forwards it and the host wounds the real body.
-            g_repl.setReportCombat(!g_cfg.isHost);
+            // local2: the host reports too - its swings on join-authored world
+            // NPC copies are guarded (cosmetic) and would otherwise be lost.
+            // Without cell authority publishCombatHits addresses everything to
+            // the host itself and drops it, so host behaviour is unchanged.
+            g_repl.setReportCombat(true);
             coopLog(g_cfg.isHost
-                ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
+                ? "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (host, join-authored NPCs)"
                 : "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (join)");
         } else {
             coopLog("[dmg] FAILED to install hitByMeleeAttack detour; damage guard disabled");

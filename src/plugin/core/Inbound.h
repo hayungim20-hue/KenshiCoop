@@ -85,6 +85,7 @@ struct InboundNativeTaken {
 // authority); position authority stays with the 20 Hz entity stream.
 struct InboundNpcCensus {
     u32                ownerId;
+    bool               complete; // false: only positive existence evidence (v66)
     std::vector<u32>   hands; // count*5, readObjectHand layout
     std::vector<float> pos;   // count*3, host position per row (v38 parking)
 };
@@ -575,9 +576,10 @@ public:
     }
     // NET thread: one received NPC existence census (protocol 36), owner-tagged.
     void pushNpcCensus(u32 ownerId, const u32* hands, const float* pos,
-                       unsigned int count) {
+                       unsigned int count, bool complete = true) {
         InboundNpcCensus nc;
         nc.ownerId = ownerId;
+        nc.complete = complete;
         if (hands && count > 0) nc.hands.assign(hands, hands + count * 5);
         if (pos && count > 0) nc.pos.assign(pos, pos + count * 3);
         EnterCriticalSection(&cs_); npcCensus_.push_back(nc); LeaveCriticalSection(&cs_);

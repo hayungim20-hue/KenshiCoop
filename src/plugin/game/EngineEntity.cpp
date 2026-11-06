@@ -1022,9 +1022,10 @@ unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outState
 unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
                           EntityState* outStates, unsigned int maxOut,
                           bool* outTruncated) {
-    if (outTruncated) *outTruncated = false;
+    if (outTruncated) *outTruncated = true;
     if (!g_getCharsFn || !gw || !outChars || !outStates || maxOut == 0) return 0;
     if (radius <= 0.0f) return 0;
+    if (outTruncated) *outTruncated = false;
     unsigned int n = 0;
     __try {
         // Same dual-interest centers as the stream bubble, but the query
@@ -1032,13 +1033,16 @@ unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
         // findNearbyNonPlayerFaction whole-block scan) with wide limits.
         Ogre::Vector3 centers[MAX_INTEREST_ANCHORS];
         unsigned int nc = interestCenters(gw, centers);
-        if (nc == 0) return 0;
+        if (nc == 0) { if (outTruncated) *outTruncated = true; return 0; }
         for (unsigned int ci = 0; ci < nc; ++ci) {
             if (n >= maxOut) { if (outTruncated) *outTruncated = true; break; }
             g_npcQuery.clear();
             g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, radius, radius,
                          512, 512, 0);
             unsigned int total = g_npcQuery.size();
+            // The engine query has its OWN cap in addition to maxOut. A full
+            // query cannot prove that there were no further bodies to return.
+            if (total >= 512 && outTruncated) *outTruncated = true;
             unsigned int i = 0;
             for (; i < total && n < maxOut; ++i) {
                 RootObject* obj = g_npcQuery[i];
@@ -1050,10 +1054,12 @@ unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
                     if (outChars[k] == ch) { dup = true; break; }
                 if (dup) continue;
                 if (captureOne(ch, &outStates[n])) { outChars[n] = ch; ++n; }
+                else if (outTruncated) *outTruncated = true;
             }
             if (i < total && outTruncated) *outTruncated = true;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (outTruncated) *outTruncated = true;
         return n;
     }
     return n;

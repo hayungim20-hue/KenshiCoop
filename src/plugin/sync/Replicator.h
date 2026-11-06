@@ -29,6 +29,8 @@
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
 #include "ChangeGate.h"  // protocol 56: sync::SenderSeq (per-sender row seq guard)
+#include "CombatPolicy.h"
+#include "BuildRetry.h"
 
 class GameWorld;
 class Character;
@@ -1027,6 +1029,9 @@ private:
                                       //   so neither side reads down on the release tick. This
                                       //   bridges that hole - see the carried carve-out.
         bool         combatArmed;     // Stage 3c: a melee-attack order is currently issued
+        bool         downTgtLogged;   // local2: logged 'target down locally' this episode
+        bool         koReported;      // local2b: local KO of an author-upright copy already reported
+        unsigned long authorDownMs;   // local2b: last time the author's stream said down
         unsigned long combatTick;     // when the attack order was (re-)issued (re-arm throttle)
         unsigned int combatOrders;    // orders issued this combat episode (re-issue backoff)
         u32          combatTgtIdx;    // target hand (index/serial) of the last issued order,
@@ -1170,7 +1175,7 @@ private:
                    taskNoneTick(0), taskLapseTick(0), taskLapses(0),
                    detached(false), downApplied(false),
                    koLatched(false), deathLatched(false), carriedDown(false),
-                   combatArmed(false), combatTick(0), combatOrders(0),
+                   combatArmed(false), downTgtLogged(false), koReported(false), authorDownMs(0), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
                    combatOverTick(0), combatLockTick(0), npcSnapTick(0),
@@ -1437,7 +1442,8 @@ private:
         std::map<Key, CensusPos> prev;
         unsigned long            recvMs;
         unsigned long            prevMs;
-        PeerCensus() : recvMs(0), prevMs(0) {}
+        bool                     complete;
+        PeerCensus() : recvMs(0), prevMs(0), complete(false) {}
     };
     std::map<u32, PeerCensus> census_;        // sender ownerId -> its census
     std::map<Key, u32>        censusOwnerOf_; // merged view: which sender lists a hand
@@ -1446,6 +1452,9 @@ private:
     // Does any CURRENT census list this hand? With one sender this is exactly
     // the legacy "census fresh && hand in censusHands_".
     bool censusVouches(const Key& k, unsigned long now) const;
+    // Only the body's current author can establish absence, using a complete,
+    // fresh enumeration. A truncated list or stalled peer cannot hide NPCs.
+    bool censusCanRejectAt(GameWorld* gw, float x, float z, unsigned long now) const;
     enum { CENSUS_FRESH_MS = 5000 };
     // Per-key state for the two ways a census row can correct its local body:
     // the walk that converges it, and the teleport of last resort.
@@ -1574,6 +1583,7 @@ private:
     unsigned long            claimSendMs_;  // 1 Hz sample throttle
     unsigned long            claimAssertMs_; // periodic re-assert
     unsigned long            claimMapMs_;    // [cell] MAP dump cadence
+    unsigned long            cellMapChangedMs_; // local2b: last time the resolved cell map changed
     enum {
         CELL_OWNER_HOST   = 0,    // NetLink gives the host id 0
         CELL_DWELL_N      = 3,    // samples at 1 Hz
@@ -1714,6 +1724,7 @@ private:
     // corpse keys are in censusContainers_ too (same authoring + gating).
     bool           corpseSync_;
     std::map<Key, Key> censusCorpses_;
+    std::map<Key, unsigned long> censusCorpseSeenMs_;
     // Protocol 60. Host: the census rows that are shop counters (their
     // snapshots carry INV_FLAG_SHOP). Join: per mirrored counter, the per-item
     // totals the host last put there (vendorBase_) and the unsettled local
@@ -2004,10 +2015,13 @@ private:
         u32           dstAcker;
         bool          srcSettled; // that end's owner has answered
         bool          dstSettled;
+        int           rollbackDone; // refused units already restored locally
+        unsigned int  rollbackTries; // local2c: bounded rollback retries
+        unsigned long rollbackNextMs;
     };
     std::map<u32, XferOut>                    xferOut_;
-    // Undo one intent's contribution to a peer end's reconcile-suppression
-    // latch (protocol 50). See the definition for why every verdict does this.
+    // Remove only refused units from a peer-end latch. Accepted units stay
+    // protected until the post-transfer owner snapshot catches up.
     void releaseXferLatch(const Key& k, const XKey& key, int delta);
     std::map<std::pair<Key, std::string>, unsigned long> wdSuppress_;
     unsigned long                             xferScanMs_; // last detector scan
@@ -2271,10 +2285,13 @@ private:
     // damage into pendingHits_ (keyed by the copy's canonical hand), and
     // publishCombatHits forwards it to the host. nextHitId_ is a per-sender counter
     // for log correlation.
-    struct PendingHit { float flesh; float blood; PendingHit() : flesh(0.0f), blood(0.0f) {} };
+    struct PendingHit { float flesh; float blood; float ko; PendingHit() : flesh(0.0f), blood(0.0f), ko(0.0f) {} };
     bool                 reportCombat_;
     std::map<Key, PendingHit> pendingHits_;
     unsigned int         nextHitId_;
+    sync::CombatReplay combatReplay_;
+    struct PendingCombatHit { CombatHitPacket pkt; unsigned long receivedMs; };
+    std::deque<PendingCombatHit> pendingCombatHits_;
 
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;
@@ -2394,8 +2411,9 @@ private:
     struct DoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
         sync::SenderSeq seqSeen; bool seeded;
+        unsigned long remoteMs; // local2f: last time a peer's state was applied
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    seeded(false) {}
+                    seeded(false), remoteMs(0) {}
     };
     std::map<Key, DoorRow> doorRows_;
     u32           doorSeqOut_;
@@ -2404,11 +2422,12 @@ private:
     // Protocol 27 placed-building sync. OwnBuild = a building WE placed
     // (registered from the local placement edge; we are its progress
     // authority): lastProg/lastComplete = change gate, lastSendMs = safety
-    // resend, doneSent latches the channel silent once the final complete row
-    // went out. PeerBuild = a building the PEER placed (learned from
+    // resend, doneSent records whether a complete row went out (completed
+    // rows and announcements still safety-resend). PeerBuild = a building the PEER placed (learned from
     // PKT_BUILD_PLACE): the key -> local-hand translation entry; minted=0
-    // remembers a refused mint so resends don't retry the factory forever;
-    // seqSeen = stale STATE-row guard.
+    // retains pending placement/state across unloaded zones and refused
+    // engine calls; bounded retry avoids factory loops after an engine fault.
+    // seqSeen = stale STATE-row guard, distinct from pending application.
     struct OwnBuild {
         unsigned int hand[5];
         float lastProg; int lastComplete; unsigned long lastSendMs;
@@ -2419,8 +2438,9 @@ private:
         // (the template sid lives in the edge, not on the Building).
         BuildPlacePacket ann;
         bool haveAnn;
+        unsigned long lastAnnSendMs;
         OwnBuild() : lastProg(-1.0f), lastComplete(-1), lastSendMs(0),
-                     doneSent(false), removed(false), haveAnn(false) {
+                     doneSent(false), removed(false), haveAnn(false), lastAnnSendMs(0) {
             memset(hand, 0, sizeof(hand));
             memset(&ann, 0, sizeof(ann));
         }
@@ -2429,7 +2449,15 @@ private:
         unsigned int localHand[5];
         int minted; u32 seqSeen;
         bool removed; // proxy destroyed on a REMOVE: tombstone (rows skip)
-        PeerBuild() : minted(0), seqSeen(0), removed(false) { memset(localHand, 0, sizeof(localHand)); }
+        BuildPlacePacket ann;
+        BuildStatePacket state;
+        bool haveAnn, haveState, removePending;
+        unsigned long helpSentMs; float helpSentProg; // local2d: helper progress reports
+        sync::BuildRetry mintRetry, stateRetry, removeRetry;
+        PeerBuild() : minted(0), seqSeen(0), removed(false), haveAnn(false), haveState(false), removePending(false), helpSentMs(0), helpSentProg(-1.0f) {
+            memset(localHand, 0, sizeof(localHand));
+            memset(&ann, 0, sizeof(ann)); memset(&state, 0, sizeof(state));
+        }
     };
     std::map<Key, OwnBuild>  ownBuilds_;
     // Keyed (placer id, placer key): runtime hands are allocated per client, so
@@ -2557,6 +2585,7 @@ private:
                     knownOwned(-1) {}
     };
     std::map<Key, DeedRow> deedRows_;
+    std::set<Key> furnClaimChecked_; // local2g: owned buildings whose interior was re-owned once
     u32           deedSeqOut_;
     unsigned long deedSampleMs_;
     unsigned long deedAuditMs_; // last wide-state dump (owner-vs-peer diff)
@@ -2624,6 +2653,11 @@ private:
     // as a minted/adopted proxy (proxyByKey_). False for anything else, and for
     // a flagged key that is not a proxy here (it resolves verbatim).
     bool corpseLocalHand(const Key& k, unsigned int out[5]) const;
+    bool sharedBodyInventory(const Key& k) const {
+        if (censusCorpses_.count(k) != 0) return true;
+        std::map<Key, InvRecv>::const_iterator it = invRecv_.find(k);
+        return it != invRecv_.end() && it->second.corpse;
+    }
     // Protocol 56: which player authors a container we do NOT author - the
     // sender of its latest snapshot (InvRecv::ownerId). OWNER_ID_ALL = unknown
     // (no snapshot yet). Used to pick the fixture hand space and the expected
@@ -2639,6 +2673,15 @@ private:
         if (ownedContainers_.count(k) != 0 || ownHands_.count(k) != 0 ||
             censusContainers_.count(k) != 0)
             return localId;
+        // local2b: a census corpse is keyed by its STREAM key, but a drag out of it
+        // names the body's LOCAL hand - for a bound proxy of a peer's NPC the two
+        // differ, and the local hand fell through to 'peer'. The host then asked the
+        // peer to approve its own loot while also publishing the body as author; the
+        // two snapshot streams raced and rejected items vanished from both sides
+        // (field run 2026-11-03: 3 of 5 items looted off a KO'd proxy slaver lost).
+        for (std::map<Key, Key>::const_iterator ci = censusCorpses_.begin();
+             ci != censusCorpses_.end(); ++ci)
+            if (!(ci->second < k) && !(k < ci->second)) return localId;
         return peerContainerOwner(k);
     }
     // Protocol 23 recruitment sync state.
@@ -2703,6 +2746,26 @@ private:
         TabOwner() : owner(0), mine(false), seeded(false) {}
     };
     std::map<std::pair<u32, u32>, TabOwner> tabOwned_;
+    // local2f: a body WE moved into another player's squad, by its OLD serial ->
+    // its new LOCAL hand. That player streams it under their own re-container
+    // hand (same serial, different index/container), which never resolves here.
+    std::map<u32, Key> movedOutBySerial_;
+    // local2h: the PEER's wire key -> our local body, for a body insertPeerMember
+    // re-containered under a local hand that differs from the key the peer named
+    // it by (each engine numbers platoons independently). The peer's NEXT edge for
+    // that body names it by this wire key; a CONTROL-FLIP claim keeps no proxy
+    // binding, so without the alias the second move resolved nowhere and the
+    // rekey force-REQ'd and minted a stranger (2026-11-07: Weiyi moved into the
+    // host's tab and back -> a new level-0 member in Karl's squad, the real one
+    // orphaned on the host). Values are re-proved alive before use.
+    std::map<Key, Character*> peerAliasBody_;
+    // local2h: (the peer's wire key, OUR local hand) for a body we just CLAIMED
+    // (transfer into our tab) whose local hand differs from the wire key. We will
+    // stream it under the local hand, which the peer has never heard of - so tell
+    // it, as an EVT_SQUAD_MOVE wire->local, and its ordinary rekey binds its copy
+    // to our stream (else that copy runs on its own AI: the 16-minute parallel
+    // world of 2026-11-07). Flushed by publishSquadMoves.
+    std::vector<std::pair<Key, Key> > rebindOut_;
     // Number of tabs present at session-start seeding, i.e. the length of the
     // rank prefix that means the same thing on both clients. Ranks past it are
     // assigned in local first-seen order and DIVERGE (measured: host rank 2 =
@@ -3030,6 +3093,7 @@ private:
     // Recompute claimedCells_ from claimSlots_. The lowest player id wins a
     // contested cell; then the co-location collapse is applied.
     void rebuildClaimedCells();
+    void rebuildClaimedCellsCore();
     // Are squads standing together? Fills collapseTo_ (player -> the lowest id
     // it collapses onto) and returns the TOTAL verdict (every claiming player
     // collapses onto the host). Player o collapses onto the lowest m < o such

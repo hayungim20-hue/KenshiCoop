@@ -25,7 +25,9 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 65;
+// Local repair 2 requires both peers' KO-inventory ownership and building
+// retry rules. Reject local1/upstream peers even though layouts are unchanged.
+const u16 PROTOCOL_VERSION = 73; // local2h: v72 + trade cash only when moved / ignore empty reports + proxy destroy guard (forces both sides onto the same build)
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -1078,6 +1080,7 @@ struct TreatmentPacket {
 struct CombatHitPacket {
     u8  type;    // = PKT_COMBAT_HIT
     u32 ownerId; // network player id of the sender (the ATTACKER's machine)
+    u32 targetOwnerId; // protocol 67: NPC author at the time of the hit
     u32 hitId;   // monotonic per-sender (log correlation)
     // victim hand (the host-owned world NPC that was struck), canonical key
     u32 sType;
@@ -1087,6 +1090,7 @@ struct CombatHitPacket {
     u32 sSerial;
     f32 flesh;   // accumulated flesh damage to apply (frontal part)
     f32 blood;   // accumulated blood loss to apply
+    f32 koSeconds; // protocol 68: knockout the non-author saw locally (assassination)
 };
 
 // Consensus game speed (pause/1x/2x/3x). As PKT_SPEED_REQ it carries one
@@ -1739,11 +1743,13 @@ struct JoinStatePacket {
 struct NpcCensusHeader {
     u8  type;    // = PKT_NPC_CENSUS
     u32 ownerId; // network player id of the sender (the host)
-    u16 count;   // number of 5xu32 hands (then 3xf32 positions) that follow
+    u16 count;   // low 15 bits: row count; high bit: incomplete enumeration (v66)
 };
 
 // Hard cap on hands per census packet (512 * 20 B = ~10 KB, fragmented fine).
 const unsigned int NPC_CENSUS_MAX = 512;
+const u16 NPC_CENSUS_INCOMPLETE = 0x8000u;
+const u16 NPC_CENSUS_COUNT_MASK = 0x7fffu;
 
 // Camera hint (protocol 43, BOTH directions, ~1 Hz UNRELIABLE latest-wins):
 // the sender's camera world center, so the receiver can anchor an interest

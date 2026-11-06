@@ -388,6 +388,10 @@ bool  markerCaptionIs(void* label, const char* text);
 // knockDown drops a Character into (on=true) / out of (on=false) full-body
 // ragdoll - the join calls it to reproduce a host-authoritative down edge.
 bool knockDown(Character* c, bool on);
+// local2b: real knockout for 'seconds' (collapse + medical KO timer). SEH-guarded.
+bool knockoutFor(Character* c, float seconds);
+// local2b: the body's current medical KO timer in seconds (0 if unreadable).
+float readKnockoutTimer(Character* c);
 // Maintain an already-down body each tick by topping the KO timer (no re-collapse).
 // Prevents the get-up/flop flicker without re-triggering the ragdoll fall. Join-side.
 bool holdDown(Character* c);
@@ -661,7 +665,7 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
 // Returns true if anything changed.
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count,
-                            bool truncated = false);
+                            bool truncated = false, bool nestedComplete = false);
 
 // SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
 // cHand carries - a worn backpack's own private inventory, which is a different Inventory from
@@ -788,7 +792,7 @@ int removeItemsFromContainerBySid(GameWorld* gw, const unsigned int cHand[5],
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
                               const char* sid, unsigned int typeCat, int qty,
-                              bool suspendVeto = true);
+                              bool suspendVeto = true, bool* outDestinationRefused = 0);
 
 // ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
 // The engine has no single "drag" entry point (the squad-move problem), so a
@@ -2013,6 +2017,17 @@ struct DeedAudit {
 // SEH-guarded wide audit of one building by hand. Returns false when the hand
 // does not resolve locally (out is still zero-filled with resolved=0).
 bool auditDeed(GameWorld* gw, const unsigned int bHand[5], DeedAudit* out);
+// local2e: hands (object order) of the NON-player furniture/interior objects that
+// belong to building bHand (Building::furnitureParentBuilding or isIndoors). A real
+// purchase removes the previous owner's furniture; the deed write does not, so the
+// peer applies this list. Returns the count, or -1 if bHand does not resolve.
+int listForeignFurniture(GameWorld* gw, const unsigned int bHand[5],
+                         unsigned int (*out)[5], unsigned int maxOut);
+// local2g: non-player STORAGE/machine buildings within 40 u of building bHand that
+// carry no interior/furniture link - what an older co-op build minted ownerless
+// (the engine then handed them to the town). Same return convention.
+int listOwnerlessPlacedNear(GameWorld* gw, const unsigned int bHand[5],
+                            unsigned int (*out)[5], unsigned int maxOut);
 
 // ---- Protocol 27: placed-building sync ---------------------------------------
 // One placed-building/construction-site row. The template GameData stringID is
@@ -2242,7 +2257,7 @@ struct CorpseRead {
 // killed is only held DOWN (the death latch), never engine-dead, so a lookup on
 // that side passes false. Returns the count written.
 unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
-                               unsigned int maxOut, bool deadOnly);
+                               unsigned int maxOut, bool deadOnly, bool includeDowned = false);
 
 // Nearest BCTYPE_PRODUCTION building (a resource mine) to the leader, or null.
 // Class-matched rather than name-matched, and searched wide, because a mine's
@@ -2404,6 +2419,10 @@ int captureTraderStock(GameWorld* gw, const unsigned int traderHand[5], InvItemE
 // stock is not reachable (window closed) - apply again at the next open, -1 fault.
 int applyTraderStock(GameWorld* gw, const unsigned int traderHand[5], const InvItemEntry* items,
                      unsigned int count, bool truncated, int money);
+// SEH-guarded (local2h): run the trader platoon's own stock refresh
+// (ActivePlatoon::refreshInventory, firstTime) past the join-side gate - for a
+// shop that opened EMPTY with no money here. 1 ran, 0 unresolved, -1 fault.
+int restockTrader(GameWorld* gw, const unsigned int traderHand[5]);
 // SEH-guarded (tests): buy the first loose ONE-UNIT stack of the trader's SHOP stock
 // (the trade window's own inventory) into buyerHand. 1 bought, 0 nothing to buy,
 // -1 no shop stock here (the window was never opened) / fault.

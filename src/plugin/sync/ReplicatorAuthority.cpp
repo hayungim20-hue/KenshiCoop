@@ -10,6 +10,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "CensusPolicy.h"
 
 namespace coop {
 
@@ -91,6 +92,7 @@ void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
             superseded = (li->ownerId == nc.ownerId);
         if (superseded) continue;
         PeerCensus& pc = census_[nc.ownerId];
+        pc.complete = nc.complete;
         pc.hands.clear();
         // Keep the outgoing rows as the previous sample before they are
         // overwritten: two consecutive census positions FROM THE SAME AUTHOR are
@@ -198,6 +200,26 @@ bool Replicator::censusVouches(const Key& k, unsigned long now) const {
         if (it->second.hands.find(k) != it->second.hands.end()) return true;
     }
     return false;
+}
+
+bool Replicator::censusCanRejectAt(GameWorld* gw, float x, float z,
+                                  unsigned long now) const {
+    // Explicitly disabling the census retains the legacy stream-only policy.
+    if (censusRadius_ <= 0.0f) return true;
+    u32 owner = cellAuth_ ? authorityFor(gw, x, z) : (u32)CELL_OWNER_HOST;
+    std::map<u32, PeerCensus>::const_iterator it = census_.find(owner);
+    if (it == census_.end()) return false;
+    // local2b: the census must postdate the last cell-map change by a margin, or
+    // the new author's 'complete, empty' pre-handover census reads as 'nobody
+    // here' and the whole cell is hidden (field run 2026-11-03 21:27:11: 15 NPCs
+    // suppressed 0.5 s after the join took a cell, census=0).
+    const unsigned long CENSUS_AFTER_MAP_MS = 1500;
+    if (cellAuth_ && cellMapChangedMs_ != 0 &&
+        (long)(it->second.recvMs - cellMapChangedMs_) < (long)CENSUS_AFTER_MAP_MS)
+        return false;
+    return sync::censusAllowsAbsence(
+        it->second.complete, (u32)it->second.recvMs, (u32)now,
+        (u32)CENSUS_FRESH_MS);
 }
 
 void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
@@ -432,6 +454,13 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         bool exists = streamed || (censusFresh && censusVouches(k, nowE));
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
+        // An incomplete/stale census is silence about missing rows, not a
+        // negative existence claim. In particular, near-bubble NPCs must not
+        // fall back to stream-only suppression during a peer's loading stall.
+        if (!exists && !censusCanRejectAt(gw, states[i].x, states[i].z, nowE)) {
+            ac.unstreamed = 0;
+            continue;
+        }
         // Dormant and census-absent: neither client is speaking for this
         // region, so there is nothing to judge. Hold the debounce at zero
         // rather than letting it climb silently - when attention does arrive,
@@ -565,6 +594,10 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                           keep.find(k) != keep.end() || driven;
             std::map<Key, Character*>::iterator s = suppressed_.find(k);
             AuthCount& ac = authCount_[k];
+            if (!exists && !censusCanRejectAt(gw, wStates[i].x, wStates[i].z, nowE)) {
+                ac.unstreamed = 0;
+                continue;
+            }
             // Dormancy, same as the near pass - and this is where it matters
             // most. The wide pass reaches out to censusRadius_ (2000 u), far
             // past anywhere either player is looking, so most of what it used
@@ -686,6 +719,30 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             // (pointer identity survives the re-containering); never re-hide a
             // body applyTargets drove this tick.
             if (drivenChars_.find(it->second) != drivenChars_.end()) { ++it; continue; }
+            // local2: a body hidden on a previous author's word must come back
+            // when its cell returns to us. The passes above only restore what
+            // they enumerate, and a suppressed body can drop out of that
+            // enumeration for good (field run 2026-11-03: two host NPCs stayed
+            // hidden after the join's cell collapsed back to the host). Nothing
+            // in a cell we author is ever suppressed (authorHoldsBody skips it),
+            // so a hidden body standing in one is always stale.
+            if (cellAuth_ && gw) {
+                float px = 0.0f, py = 0.0f, pz = 0.0f;
+                if (engine::readPos(it->second, &px, &py, &pz) &&
+                    authorityFor(gw, px, pz) == localId) {
+                    engine::restoreNpc(gw, it->second);
+                    ++authRestores_;
+                    lifeSet(it->first, LIFE_RESOLVED, "author-restore");
+                    char rb[160]; _snprintf(rb, sizeof(rb) - 1,
+                        "[cell] restore NPC hand=%u,%u owner=%u (reassert: we author here; supp=%u)",
+                        (unsigned)it->first.i, (unsigned)it->first.s, localId,
+                        (unsigned)suppressed_.size() - 1u);
+                    rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                    authCount_.erase(it->first);
+                    suppressed_.erase(it++);
+                    continue;
+                }
+            }
             engine::suppressNpc(gw, it->second);
             ++it;
         }
@@ -1111,7 +1168,18 @@ unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
     return nOut;
 }
 
+// local2b: remember WHEN the resolved map last changed. A census only speaks for
+// the cells its sender authored when it was built; one sent before a handover is
+// complete and fresh yet says nothing about the cell that just changed hands.
 void Replicator::rebuildClaimedCells() {
+    std::map<std::pair<int, int>, u32> prevCells = claimedCells_;
+    bool prevCollapsed = collapsed_;
+    rebuildClaimedCellsCore();
+    if (prevCells != claimedCells_ || prevCollapsed != collapsed_)
+        cellMapChangedMs_ = nowMs();
+}
+
+void Replicator::rebuildClaimedCellsCore() {
     claimedCells_.clear();
     for (std::map<std::pair<u32, u32>, CellClaim>::const_iterator it = claimSlots_.begin();
          it != claimSlots_.end(); ++it) {

@@ -1058,7 +1058,11 @@ std::vector<BuildEdgeRec> g_buildEdges;
 // capture is deaf during world load and world swaps (when the engine creates
 // every building in the save) and awake only during live gameplay.
 bool g_buildCaptureArmed = false;
-void setBuildCaptureArmed(bool armed) { g_buildCaptureArmed = armed; }
+void setBuildCaptureArmed(bool armed) {
+    if(g_buildCaptureArmed!=armed)
+        coop::logLine(armed ? "[build] CAPTURE armed" : "[build] CAPTURE disarmed");
+    g_buildCaptureArmed = armed;
+}
 
 // Creating ONE building can create more: a multi-storey commit nests a
 // createBuilding per floor inside the outermost call. Only the outermost is the
@@ -1083,6 +1087,7 @@ static void queueLocalBuildEdge(Building* b, int floorNum) {
         strncpy(e.sid, gd->stringID.c_str(), sizeof(e.sid) - 1);
         e.sid[sizeof(e.sid) - 1] = '\0';
     }
+    if(!e.sid[0]) { coop::logLine("[build] LOCAL-PLACE-NOTEMPLATE"); return; }
     // Every way capture can decline to stream gets its own line: a player who
     // built something the peer never saw must be diagnosable from one log.
     if (!readObjectHand(ro, e.hand)) {
@@ -2493,10 +2498,11 @@ bool installDismantleHook() {
 }
 
 unsigned int drainRemoveEdges(unsigned int (*out)[5], unsigned int maxOut) {
+    if(!out || !maxOut) return 0;
     unsigned int n = 0;
     for (unsigned int i = 0; i + 5 <= g_removeEdges.size() && n < maxOut; i += 5, ++n)
         for (int j = 0; j < 5; ++j) out[n][j] = g_removeEdges[i + j];
-    g_removeEdges.clear();
+    g_removeEdges.erase(g_removeEdges.begin(),g_removeEdges.begin()+n*5);
     return n;
 }
 
@@ -2505,6 +2511,7 @@ void queueRemoveEdge(const unsigned int bHand[5]) {
 }
 
 unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut) {
+    if(!out || !maxOut) return 0;
     unsigned int n = 0;
     for (unsigned int i = 0; i < g_buildEdges.size() && n < maxOut; ++i, ++n) {
         memcpy(out[n].hand, g_buildEdges[i].hand, sizeof(out[n].hand));
@@ -2516,7 +2523,7 @@ unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut) {
         out[n].fromUi = g_buildEdges[i].fromUi;
         memcpy(out[n].sid, g_buildEdges[i].sid, sizeof(out[n].sid));
     }
-    g_buildEdges.clear();
+    g_buildEdges.erase(g_buildEdges.begin(), g_buildEdges.begin() + n);
     return n;
 }
 

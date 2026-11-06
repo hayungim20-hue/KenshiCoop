@@ -4,6 +4,7 @@
 #include "SteamP2P.h"
 #include "../CoopLog.h"
 #include "../devtools/PacketRecorder.h"
+#include "../sync/CensusPolicy.h"
 
 #include <cstring>
 #include <cstdio>
@@ -225,10 +226,12 @@ void NetLink::queueWorldClaim(u32 ownerId, u32 authorId, const u32* netIds,
 }
 
 void NetLink::queueNpcCensus(u32 ownerId, const u32* hands, const float* pos,
-                             unsigned int count) {
+                             unsigned int count, bool complete) {
     OutNpcCensus oc;
     oc.ownerId = ownerId;
-    if (count > NPC_CENSUS_MAX) count = NPC_CENSUS_MAX;
+    oc.complete = complete;
+    if (count > NPC_CENSUS_MAX) { count = NPC_CENSUS_MAX; oc.complete = false; }
+    if (count > 0 && (!hands || !pos)) { count = 0; oc.complete = false; }
     if (hands && count > 0) oc.hands.assign(hands, hands + count * 5);
     if (pos && count > 0) oc.pos.assign(pos, pos + count * 3);
     pushLocked(outCs_, outNpcCensus_, oc);
@@ -928,19 +931,17 @@ void NetLink::threadLoop() {
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(NpcCensusHeader) && inbound_) {
                             NpcCensusHeader hdr;
-                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
-                            unsigned need = sizeof(NpcCensusHeader)
-                                          + (unsigned)hdr.count * 5 * sizeof(u32)
-                                          + (unsigned)hdr.count * 3 * sizeof(float);
-                            if (len >= need && hdr.count <= NPC_CENSUS_MAX) {
+                            sync::CensusFrame frame;
+                            if (sync::readCensusFrame(ev.packet->data, len, hdr, frame)) {
                                 const enet_uint8* p = ev.packet->data + sizeof(NpcCensusHeader);
                                 const u32* hands =
-                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
-                                const float* pos = (hdr.count > 0)
+                                    (frame.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                const float* pos = (frame.count > 0)
                                     ? reinterpret_cast<const float*>(
-                                          p + (unsigned)hdr.count * 5 * sizeof(u32))
+                                          p + frame.count * 5 * sizeof(u32))
                                     : 0;
-                                inbound_->pushNpcCensus(hdr.ownerId, hands, pos, hdr.count);
+                                inbound_->pushNpcCensus(hdr.ownerId, hands, pos,
+                                                       frame.count, frame.complete);
                             }
                         }
                     } else if (type == PKT_WORLD_DROP) {
@@ -994,9 +995,22 @@ void NetLink::threadLoop() {
                         // Reliable join-dealt damage report (join -> host): the
                         // host wounds the authoritative world NPC.
                         CombatHitPacket chp;
-                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
-                            && inbound_) {
-                            inbound_->pushCombatHit(chp.ownerId, chp);
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)) {
+                            const u32 sender = isHost_ ? (u32)(size_t)ev.peer->data : chp.ownerId;
+                            if (chp.ownerId != sender) {
+                                netLog("combat hit with spoofed ownerId dropped");
+                            } else if (isHost_ && chp.targetOwnerId != 0 &&
+                                       chp.targetOwnerId < MAX_PLAYERS &&
+                                       chp.targetOwnerId != sender) {
+                                // local2 star relay: join -> join hit (the NPC's
+                                // author is another join). Forward to that join
+                                // only; the host does not apply it.
+                                ENetPacket* fwd = enet_packet_create(ev.packet->data,
+                                    ev.packet->dataLength, ENET_PACKET_FLAG_RELIABLE);
+                                if (fwd) sendOut(fwd, CH_RELIABLE, peerBit(chp.targetOwnerId), ev.peer);
+                            } else if (inbound_) {
+                                inbound_->pushCombatHit(chp.ownerId, chp);
+                            }
                         }
                     } else if (type == PKT_SPEED_REQ || type == PKT_SPEED_SET) {
                         // Reliable game-speed request/set (consensus speed sync).
@@ -1552,7 +1566,8 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < censuses.size(); ++i) {
             unsigned count = (unsigned)(censuses[i].hands.size() / 5);
-            if (count > NPC_CENSUS_MAX) count = NPC_CENSUS_MAX;
+            bool complete = censuses[i].complete;
+            if (count > NPC_CENSUS_MAX) { count = NPC_CENSUS_MAX; complete = false; }
             // v38 layout: hands block then positions block. A queue call that
             // somehow lacked positions still sends a well-formed packet
             // (zeroed positions), never a short one.
@@ -1562,7 +1577,7 @@ void NetLink::threadLoop() {
             NpcCensusHeader hdr;
             hdr.type    = (u8)PKT_NPC_CENSUS;
             hdr.ownerId = censuses[i].ownerId;
-            hdr.count   = (u16)count;
+            hdr.count   = sync::censusCountField(count, complete);
             std::memcpy(out->data, &hdr, sizeof(hdr));
             if (count > 0) {
                 std::memcpy(out->data + sizeof(hdr), &censuses[i].hands[0],

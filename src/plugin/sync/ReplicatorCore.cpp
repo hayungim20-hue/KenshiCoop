@@ -83,7 +83,7 @@ Replicator::Replicator()
       moneySync_(true), recruitSync_(true),
       squadSync_(true), tabsSeeded_(0), hostRole_(true),
       cellAuth_(false), cellCollapse_(false), collapsed_(false),
-      claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0),
+      claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0), cellMapChangedMs_(0),
       facSeqOut_(1), facSampleMs_(0), factionSync_(true),
       doorSeqOut_(1), doorSampleMs_(0), doorSync_(true),
       buildSeqOut_(1), buildSampleMs_(0), buildSync_(true),
@@ -239,6 +239,7 @@ void Replicator::resetSession() {
     claimSendMs_   = 0;
     claimAssertMs_ = 0;
     claimMapMs_    = 0;
+    cellMapChangedMs_ = 0;
     attnFlips_ = 0;
     attnWinMs_ = 0;
     // The zone verdict describes the OLD world's streaming state.
@@ -266,6 +267,7 @@ void Replicator::resetSession() {
     ownedContainers_.clear();
     censusContainers_.clear(); // protocol 34: re-censused in the new world
     censusCorpses_.clear();    // protocol 62: likewise
+    censusCorpseSeenMs_.clear();
     // Protocol 60: every counter hand + baseline belongs to the old world.
     censusShops_.clear();
     vendorBase_.clear();
@@ -299,6 +301,9 @@ void Replicator::resetSession() {
     medPub_.clear();
     medRecv_.clear();
     medNpc_.clear();
+    pendingHits_.clear();
+    pendingCombatHits_.clear();
+    combatReplay_.clear();
     statsPub_.clear();
     // Protocol 52: the pool baseline describes the OLD world's wallet, so a
     // reload must re-seed it - otherwise the newly loaded save's cats read as
@@ -320,6 +325,9 @@ void Replicator::resetSession() {
     tabOwned_.clear();
     tabsSeeded_ = 0;
     rekeyedOld_.clear();
+    peerAliasBody_.clear();    // local2h: bodies of the previous world
+    rebindOut_.clear();
+    movedOutBySerial_.clear();
     engine::clearSquadRoster();
     probed_.clear();
     spawnReq_.clear();
@@ -369,6 +377,10 @@ void Replicator::resetSession() {
 }
 
 void Replicator::clearPeerReplicationState(GameWorld* gw, u32 leaverId) {
+    combatReplay_.forget(leaverId);
+    for(std::deque<PendingCombatHit>::iterator hit=pendingCombatHits_.begin(); hit!=pendingCombatHits_.end();) {
+        if(hit->pkt.ownerId==leaverId) hit=pendingCombatHits_.erase(hit); else ++hit;
+    }
     // Destroy MINTED proxy bodies before the maps that own the pointers drop
     // them. The engine owns the bodies; a proxy left standing after the player
     // that authored it is gone is a permanent ghost, and any map still pointing
